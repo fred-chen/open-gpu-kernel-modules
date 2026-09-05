@@ -256,8 +256,12 @@ typedef struct
 // their windows outside pDynBar1Mutex) against the remote BAR1 size.
 static NvU64 g_dynBar1RemoteMappedBytes[NV_MAX_DEVICES];
 
+// METHOD3: monotonic counter used for LRU eviction of dynamic BAR1 windows.
+static NvU64 g_dynBar1LruCounter;
+
 // METHOD3: used before its definition in the subdevice teardown path.
 static void _nvGpuOpsDynBar1DestroyAll(subDeviceDesc *rmSubDevice);
+static void _nvGpuOpsDynBar1Destroy(subDeviceDesc *rmSubDevice, NvHandle hDupMemory);
 
 struct gpuSession
 {
@@ -3788,6 +3792,7 @@ typedef struct gpuDynBar1P2PMapping
     NvU64               size;              // window size (not necessarily the whole alloc)
     NvU32               iovaspaceId;       // source GPU IOVA space the window is mapped into
     RmPhysAddr          windowDmaBase;     // source-visible IOVA of window byte 0
+    NvU64               lastUsed;          // METHOD3 LRU: monotonic timestamp on map creation/hit
 } gpuDynBar1P2PMapping;
 
 // Find a window that already covers [offset, offset+size) for this handle.
@@ -4017,6 +4022,7 @@ _nvGpuOpsDynBar1Create(subDeviceDesc *rmSubDevice,
     pMap->size               = winSize;
     pMap->iovaspaceId        = pMappingGpu->busInfo.iovaspaceId;
     pMap->windowDmaBase      = dmaBase;
+    pMap->lastUsed           = ++g_dynBar1LruCounter;
 
     pMap->pNext = rmSubDevice->pDynBar1List;
     rmSubDevice->pDynBar1List = pMap;
@@ -4068,22 +4074,70 @@ _nvGpuOpsDynBar1GetOrCreate(subDeviceDesc *rmSubDevice,
 {
     NV_STATUS status = NV_OK;
     gpuDynBar1P2PMapping *pMap;
+    NvHandle hEvict = 0;   // eviction candidate (handle), not a pointer
+    NvBool bNeedEvict = NV_FALSE;
 
     portSyncMutexAcquire(rmSubDevice->pDynBar1Mutex);
     pMap = _nvGpuOpsDynBar1Find(rmSubDevice, hDupMemory, mapOffset, mapSize);
     if (pMap != NULL)
     {
+        // Reuse existing window; bump LRU timestamp.
         *pWindowDmaBase = pMap->windowDmaBase;
         *pWindowOffset  = pMap->winOffset;
+        pMap->lastUsed  = ++g_dynBar1LruCounter;
+        portSyncMutexRelease(rmSubDevice->pDynBar1Mutex);
+        return NV_OK;
     }
-    else
+
+    //
+    // No window for this request yet. Try to create one. If the remote BAR1
+    // budget is exhausted, pick the least-recently-used window belonging to
+    // another duped peer handle and evict it (windows are rebuildable caches:
+    // UVM re-creates one on the next PTE request for that range). We select
+    // the victim under the lock but destroy outside it, so no use-after-free.
+    //
+    status = _nvGpuOpsDynBar1Create(rmSubDevice, pMappingGpu, pRemoteGpu,
+                                    pAllocMemDesc, hDupMemory,
+                                    mapOffset, mapSize, pWindowDmaBase,
+                                    pWindowOffset);
+    if (status == NV_ERR_INSUFFICIENT_RESOURCES)
     {
+        NvU32 remoteInst = gpuGetInstance(pRemoteGpu);
+        NvU64 oldest = ~0ULL;
+        gpuDynBar1P2PMapping *pCur;
+
+        for (pCur = rmSubDevice->pDynBar1List; pCur != NULL; pCur = pCur->pNext)
+        {
+            if ((gpuGetInstance(pCur->pRemoteGpu) == remoteInst) &&
+                (pCur->hDupMemory != hDupMemory) &&
+                (pCur->lastUsed < oldest))
+            {
+                oldest = pCur->lastUsed;
+                hEvict = pCur->hDupMemory;
+            }
+        }
+        if (hEvict != 0)
+            bNeedEvict = NV_TRUE;
+    }
+    portSyncMutexRelease(rmSubDevice->pDynBar1Mutex);
+
+    if (bNeedEvict)
+    {
+        NV_PRINTF(LEVEL_INFO,
+                  "METHOD3: evict LRU dynamic BAR1 P2P window on GPU%u hMem 0x%x "
+                  "to make room for hMem 0x%x\n",
+                  gpuGetInstance(pRemoteGpu), hEvict, hDupMemory);
+        _nvGpuOpsDynBar1Destroy(rmSubDevice, hEvict);
+
+        // Retry the original request once after evicting.
+        portSyncMutexAcquire(rmSubDevice->pDynBar1Mutex);
         status = _nvGpuOpsDynBar1Create(rmSubDevice, pMappingGpu, pRemoteGpu,
                                         pAllocMemDesc, hDupMemory,
                                         mapOffset, mapSize, pWindowDmaBase,
                                         pWindowOffset);
+        portSyncMutexRelease(rmSubDevice->pDynBar1Mutex);
     }
-    portSyncMutexRelease(rmSubDevice->pDynBar1Mutex);
+
     return status;
 }
 
