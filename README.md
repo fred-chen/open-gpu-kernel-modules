@@ -31,10 +31,16 @@ Implementation (kernel driver only, no userspace changes):
   BAR1 is enabled on both GPUs.
 - `src/nvidia/src/kernel/gpu/bus/p2p_api.c` — whole-FB BAR1 DMA info is only
   fetched when static BAR1 exists (dynamic mode reports none).
-- `src/nvidia/src/kernel/rmapi/nv_gpu_ops.c` — dynamic per-allocation BAR1
-  windows (`_nvGpuOpsDynBar1*`) wired into the UVM external-allocation
-  PTE/phys-addr path, with a BAR1 byte-budget guard; torn down when the duped
-  peer handle is freed or the subdevice is destroyed.
+- `src/nvidia/src/kernel/rmapi/nv_gpu_ops.c` — dynamic BAR1 windows
+  (`_nvGpuOpsDynBar1*`) wired into the UVM external-allocation PTE/phys-addr
+  path. A window covers the **requested range** (rounded to 2MiB, clamped to
+  the allocation), not the whole allocation, so a multi-GiB peer-shared
+  allocation only consumes what a mapping actually touches. The BAR1
+  byte-budget guard is **per remote GPU** (`g_dynBar1RemoteMappedBytes[]`,
+  atomic): the aperture belongs to the remote GPU and is shared by all
+  sources — counting it per source overcommits the aperture under N-way
+  tensor-parallel peer sharing. All windows of a duped peer handle are torn
+  down together when the handle is freed or the subdevice is destroyed.
 
 This work was ported from the
 [`590.48.01-p2p-48g` branch](https://github.com/duanyll/open-gpu-kernel-modules)
@@ -94,8 +100,8 @@ NCCL_P2P_LEVEL=SYS <your distributed app>
 
 - With a translating (non-pt) IOMMU the dynamic windows are not mapped into the
   source GPU's IOVA space; passthrough mode is required (same as upstream).
-- Keep all P2P buffers small enough that the sum of their BAR1 windows fits in
-  the 32GiB aperture (a budget guard refuses maps past
+- The sum of BAR1 windows mapped into any **one remote GPU** must fit its
+  32GiB aperture (a per-remote budget guard refuses maps past
   `BAR1 − 64MiB`); NCCL transport buffers are tiny and unaffected.
 - A heterogeneous node mixing normal (static-BAR1) and 48GB (dynamic) cards
   does **not** advertise BAR1 P2P between the two classes (mixed pairs are
