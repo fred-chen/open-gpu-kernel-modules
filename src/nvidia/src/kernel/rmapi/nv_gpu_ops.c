@@ -4093,8 +4093,13 @@ _nvGpuOpsDynBar1GetOrCreate(subDeviceDesc *rmSubDevice,
     // No window for this request yet. Try to create one. If the remote BAR1
     // budget is exhausted, pick the least-recently-used window belonging to
     // another duped peer handle and evict it (windows are rebuildable caches:
-    // UVM re-creates one on the next PTE request for that range). We select
-    // the victim under the lock but destroy outside it, so no use-after-free.
+    // UVM re-creates one on the next PTE request for that range), then retry
+    // once. A single evict+retry is deliberate: with several concurrent
+    // sources racing on one aperture, evicting in a loop livelocks (each
+    // source re-maps what another just evicted). Genuine over-capacity --
+    // the live peer working set larger than the 32GiB BAR1 -- cannot be
+    // solved by eviction at all; that needs the peer copy to fall back to
+    // system memory instead.
     //
     status = _nvGpuOpsDynBar1Create(rmSubDevice, pMappingGpu, pRemoteGpu,
                                     pAllocMemDesc, hDupMemory,
